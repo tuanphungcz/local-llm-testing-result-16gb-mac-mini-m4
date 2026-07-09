@@ -203,6 +203,50 @@ Honestly — **not for complex agentic work**. They hallucinate on long reasonin
 
 ---
 
+## ThinkingCap-Qwen3.6-27B-MLX-4bit (multimodal, dense) — M3 Max
+
+`t-prazak/ThinkingCap-Qwen3.6-27B-MLX-4bit`, 15 GB on disk. Qwen3.6 dense checkpoint wrapped as a VLM (`text_config`/`vision_config` split), served via LM Studio's local model store (not the HF hub cache).
+
+| Engine | Config | Gen tok/s | Note |
+|---|---|---|---|
+| `mlx_lm.generate` | baseline | 17.7 | measured under heavy system load (5+ concurrent Claude Code sessions) — not a clean number |
+| `rapid-mlx serve` 0.5.10 | `--enable-mtp` | crash | `generate_step() got unexpected keyword 'mtp'` |
+| `rapid-mlx serve` 0.5.10 | no MTP | ~17.1 | no speedup over baseline |
+| `rapid-mlx serve` 0.10.5 | `--speculative-config '{"method":"mtp"}'` | blocked | eligibility gate rejects local-path models (see bug below) |
+
+**tok/s under MTP not yet measured clean** — blocked by memory pressure on a loaded system (99% projected RAM utilization after `sudo purge`, still above rapid-mlx's 85% kernel-panic warning threshold). Retest when the Mac is idle.
+
+### Bug: rapid-mlx MTP crashes on old CLI syntax
+
+`0.5.10`'s `--enable-mtp` passes `mtp=True` straight into `mlx_lm.generate_step()`, which dropped that kwarg as of `mlx-lm` 0.31.3. Fix: upgrade — `uv tool install --force rapid-mlx==0.10.5` (or `[vision]` extra for VLM-wrapped checkpoints, see below). New syntax:
+
+```bash
+rapid-mlx serve <model> --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
+```
+
+### Bug: MTP eligibility check ignores local (non-hub-cached) models
+
+`0.10.5`'s MTP gate reads `config.json` via `huggingface_hub.try_to_load_from_cache(repo_id=model_name)` — this only resolves models that live under `~/.cache/huggingface/hub/`. Anything downloaded through LM Studio (or any tool with its own model store) gets `hf_cfg=None` → `detect_mtp_eligibility(None)` → `NONE`, even when the checkpoint genuinely ships an MTP head (`text_config.mtp_num_hidden_layers: 1`). Error: `"MTP speculative-config requires a Qwen3.5 / Qwen3.6 checkpoint with mtp_num_hidden_layers >= 1 ... The loaded model does not qualify."`
+
+**Workaround — shim the HF cache** (symlinks only, no copying):
+
+```bash
+SRC="$HOME/.lmstudio/models/t-prazak/ThinkingCap-Qwen3.6-27B-MLX-4bit"
+CACHE_ROOT="$HOME/.cache/huggingface/hub/models--t-prazak--ThinkingCap-Qwen3.6-27B-MLX-4bit"
+REV="localshim0000000000000000000000000000"
+mkdir -p "$CACHE_ROOT/refs" "$CACHE_ROOT/snapshots/$REV"
+echo -n "$REV" > "$CACHE_ROOT/refs/main"
+for f in "$SRC"/*; do ln -sf "$f" "$CACHE_ROOT/snapshots/$REV/$(basename "$f")"; done
+```
+
+Then serve by repo id instead of filesystem path: `rapid-mlx serve t-prazak/ThinkingCap-Qwen3.6-27B-MLX-4bit ...`. This trick generalizes to any HF-hub-only tool pointed at a sideloaded model (LM Studio, manual downloads).
+
+Also: multimodal checkpoints (`vision_config` present) need the `[vision]` extra — `uv tool install --force "rapid-mlx[vision]==0.10.5"` — or serve refuses to load with `requires the optional mlx-vlm dependency`.
+
+### Bug: rapid-mlx memory-pressure preflight (kernel panic warning, issue #324)
+
+`rapid-mlx serve` estimates working set as `model_size × 1.5` and warns/refuses when `(currently_used_RAM + working_set) / total_RAM >= 0.85`, since Apple Silicon firmware can kernel-panic instead of raising a clean OOM under extreme unified-memory pressure. On a 36 GB Mac already running several other memory-hungry processes, a 15 GB model alone can project to 99%+ — `sudo purge` reclaims some of it but doesn't reliably get you under the line. Treat this warning as a hard stop, not a suggestion; retest on an idle machine.
+
 ## What didn't work
 
 ### M3 Max
